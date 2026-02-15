@@ -44,20 +44,6 @@ from rich.console import Console
 
 package_dir = Path(__file__).resolve().parent
 
-global_config_dir = Path(
-    os.getenv("MSWEA_GLOBAL_CONFIG_DIR") or user_config_dir("mini-swe-agent")
-)
-global_config_dir.mkdir(parents=True, exist_ok=True)
-global_config_file = Path(global_config_dir) / ".env"
-
-if not os.getenv("MSWEA_SILENT_STARTUP"):
-    Console().print(
-        f"👋 This is [bold green]mini-swe-agent[/bold green] version [bold green]{__version__}[/bold green].\n"
-        f"Check the [bold red]v2 migration guide[/] at [bold red]https://klieret.short.gy/mini-v2-migration[/]\n",
-        f"Loading global config from [bold green]'{global_config_file}'[/bold green]",
-    )
-dotenv.load_dotenv(dotenv_path=global_config_file)
-
 
 # === Protocols ===
 
@@ -439,7 +425,7 @@ from rich.rule import Rule
 
 
 console = Console(highlight=False)
-_history = FileHistory(global_config_dir / "interactive_history.txt")
+_history = FileHistory(Path(__file__).resolve().parent / "interactive_history.txt")
 _prompt_session = PromptSession(history=_history)
 _multiline_prompt_session = PromptSession(history=_history, multiline=True)
 
@@ -784,7 +770,7 @@ class DockerEnvironmentConfig(BaseModel):
     env: dict[str, str] = {}
     forward_env: list[str] = []
     timeout: int = 30
-    executable: str = os.getenv("MSWEA_DOCKER_EXECUTABLE", "docker")
+    executable: str = "docker"
     run_args: list[str] = ["--rm"]
     container_timeout: str = "2h"
     pull_timeout: int = 120
@@ -936,7 +922,7 @@ class SingularityEnvironmentConfig(BaseModel):
     env: dict[str, str] = {}
     forward_env: list[str] = []
     timeout: int = 30
-    executable: str = os.getenv("MSWEA_SINGULARITY_EXECUTABLE", "singularity")
+    executable: str = "singularity"
     sandbox_build_retries: int = 3
     global_args: list[str] = ["--quiet"]
     exec_args: list[str] = ["--contain", "--cleanenv", "--fakeroot"]
@@ -1080,7 +1066,7 @@ class BubblewrapEnvironmentConfig(BaseModel):
     cwd: str = ""
     env: dict[str, str] = {}
     timeout: int = 30
-    executable: str = os.getenv("MSWEA_BUBBLEWRAP_EXECUTABLE", "bwrap")
+    executable: str = "bwrap"
     wrapper_args: list[str] = [
         "--unshare-user-try",
         "--ro-bind",
@@ -1395,12 +1381,8 @@ class GlobalModelStats:
         self._cost = 0.0
         self._n_calls = 0
         self._lock = threading.Lock()
-        self.cost_limit = float(os.getenv("MSWEA_GLOBAL_COST_LIMIT", "0"))
-        self.call_limit = int(os.getenv("MSWEA_GLOBAL_CALL_LIMIT", "0"))
-        if (self.cost_limit > 0 or self.call_limit > 0) and not os.getenv(
-            "MSWEA_SILENT_STARTUP"
-        ):
-            print(f"Global cost/call limit: ${self.cost_limit:.4f} / {self.call_limit}")
+        self.cost_limit = 0.0
+        self.call_limit = 0
 
     def add(self, cost: float) -> None:
         """Add a model call with its cost, checking limits."""
@@ -1455,11 +1437,7 @@ def get_model_name(
         return input_model_name
     if from_config := config.get("model_name"):
         return from_config
-    if from_env := os.getenv("MSWEA_MODEL_NAME"):
-        return from_env
-    raise ValueError(
-        "No default model set. Please run `mini-extra config setup` to set one."
-    )
+    raise ValueError("No default model set. Please specify a model name.")
 
 
 _MODEL_CLASS_MAPPING = {
@@ -3346,27 +3324,17 @@ class DeterministicResponseAPIToolcallModel:
 
 import yaml
 
-builtin_config_dir = Path(__file__).parent / "config"
 
-
-def get_config_path(config_spec: str | Path) -> Path:
-    config_spec = Path(config_spec)
-    if config_spec.suffix != ".yaml":
-        config_spec = config_spec.with_suffix(".yaml")
-    candidates = [
-        Path(config_spec),
-        Path(os.getenv("MSWEA_CONFIG_DIR", ".")) / config_spec,
-        builtin_config_dir / config_spec,
-        builtin_config_dir / "extra" / config_spec,
-        builtin_config_dir / "benchmarks" / config_spec,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    raise FileNotFoundError(
-        f"Could not find config file for {config_spec} (tried: {candidates})"
-    )
+# Default configurations
+DEFAULT_AGENT_CONFIG = {
+    "agent": {
+        "system_template": "You are a helpful assistant that can execute commands on the local machine.",
+        "instance_template": "Complete the following task: {{task}}",
+        "step_limit": 0,
+        "cost_limit": 3.0,
+        "output_path": None,
+    }
+}
 
 
 def _key_value_spec_to_nested_dict(config_spec: str) -> dict:
@@ -3388,8 +3356,8 @@ def _key_value_spec_to_nested_dict(config_spec: str) -> dict:
 def get_config_from_spec(config_spec: str | Path) -> dict:
     if isinstance(config_spec, str) and "=" in config_spec:
         return _key_value_spec_to_nested_dict(config_spec)
-    path = get_config_path(config_spec)
-    return yaml.safe_load(path.read_text())
+    # Return default config if no file is specified
+    return DEFAULT_AGENT_CONFIG
 
 
 # ==============================
@@ -3477,8 +3445,7 @@ import typer
 
 app = Typer(rich_markup_mode="rich")
 
-DEFAULT_CONFIG_FILE = builtin_config_dir / "mini.yaml"
-DEFAULT_OUTPUT_FILE = global_config_dir / "last_mini_run.traj.json"
+DEFAULT_OUTPUT_FILE = package_dir / "last_mini_run.traj.json"
 
 
 _HELP_TEXT = """Run mini-SWE-agent in your local environment.
@@ -3539,7 +3506,7 @@ def main(
         None, "-l", "--cost-limit", help="Cost limit. Set to 0 to disable."
     ),
     config_spec: list[str] = typer.Option(
-        [str(DEFAULT_CONFIG_FILE)], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT
+        [], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT
     ),
     output: Path | None = typer.Option(
         DEFAULT_OUTPUT_FILE, "-o", "--output", help="Output trajectory file"
@@ -3557,7 +3524,9 @@ def main(
     console.print(
         f"Building agent config from specs: [bold green]{config_spec}[/bold green]"
     )
-    configs = [get_config_from_spec(spec) for spec in config_spec]
+    configs = [DEFAULT_AGENT_CONFIG]
+    for spec in config_spec:
+        configs.append(get_config_from_spec(spec))
     configs.append(
         {
             "run": {
@@ -3613,10 +3582,10 @@ def hello_world(
         prompt=True,
     ),
     model_name: str = typer.Option(
-        os.getenv("MSWEA_MODEL_NAME"),
+        None,
         "-m",
         "--model",
-        help="Model name (defaults to MSWEA_MODEL_NAME env var)",
+        help="Model name",
         prompt="What model do you want to use?",
     ),
 ) -> DefaultAgent:
@@ -3624,9 +3593,7 @@ def hello_world(
     agent = DefaultAgent(
         LitellmModel(model_name=model_name),
         LocalEnvironment(),
-        **yaml.safe_load(Path(builtin_config_dir / "default.yaml").read_text())[
-            "agent"
-        ],
+        **DEFAULT_AGENT_CONFIG["agent"],
     )
     agent.run(task)
     return agent
