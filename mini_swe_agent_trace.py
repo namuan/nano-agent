@@ -251,8 +251,6 @@ class AgentConfig(BaseModel):
     """Template for the first user message specifying the task (the second message overall)."""
     step_limit: int = 0
     """Maximum number of steps the agent can take."""
-    cost_limit: float = 3.0
-    """Stop agent after exceeding (!) this cost."""
     output_path: Path | None = None
     """Save the trajectory to this path."""
 
@@ -273,7 +271,6 @@ class DefaultAgent:
         self.env = env
         self.extra_template_vars = {}
         self.logger = logging.getLogger("agent")
-        self.cost = 0.0
         self.n_calls = 0
 
     def get_template_vars(self, **kwargs) -> dict:
@@ -281,7 +278,7 @@ class DefaultAgent:
             self.config.model_dump(),
             self.env.get_template_vars(),
             self.model.get_template_vars(),
-            {"n_model_calls": self.n_calls, "model_cost": self.cost},
+            {"n_model_calls": self.n_calls},
             self.extra_template_vars,
             kwargs,
         )
@@ -344,10 +341,7 @@ class DefaultAgent:
 
     def query(self) -> dict:
         """Query the model and return model messages. Override to add hooks."""
-        if (
-            0 < self.config.step_limit <= self.n_calls
-            or 0 < self.config.cost_limit <= self.cost
-        ):
+        if 0 < self.config.step_limit <= self.n_calls:
             raise LimitsExceeded(
                 {
                     "role": "exit",
@@ -357,7 +351,6 @@ class DefaultAgent:
             )
         self.n_calls += 1
         message = self.model.query(self.messages)
-        self.cost += message.get("extra", {}).get("cost", 0.0)
         self.add_messages(message)
         return message
 
@@ -380,7 +373,6 @@ class DefaultAgent:
         agent_data = {
             "info": {
                 "model_stats": {
-                    "instance_cost": self.cost,
                     "api_calls": self.n_calls,
                 },
                 "config": {
@@ -469,7 +461,7 @@ class InteractiveAgent(DefaultAgent):
             )
             if role == "assistant":
                 console.print(
-                    f"\n[red][bold]mini-swe-agent[/bold] (step [bold]{self.n_calls}[/bold], [bold]${self.cost:.2f}[/bold]):[/red]\n",
+                    f"\n[red][bold]mini-swe-agent[/bold] (step [bold]{self.n_calls}[/bold]):[/red]\n",
                     end="",
                     highlight=False,
                 )
@@ -502,11 +494,10 @@ class InteractiveAgent(DefaultAgent):
                 return super().query()
         except LimitsExceeded:
             console.print(
-                f"Limits exceeded. Limits: {self.config.step_limit} steps, ${self.config.cost_limit}.\n"
-                f"Current spend: {self.n_calls} steps, ${self.cost:.2f}."
+                f"Limits exceeded. Limits: {self.config.step_limit} steps.\n"
+                f"Current spend: {self.n_calls} steps."
             )
             self.config.step_limit = int(input("New step limit: "))
-            self.config.cost_limit = float(input("New cost limit: "))
             return super().query()
 
     def step(self) -> list[dict]:
@@ -1370,40 +1361,6 @@ class SwerexModalEnvironment:
 # Models - global stats
 # ==============================
 
-import threading
-
-
-class GlobalModelStats:
-    """Global model statistics tracker with optional limits."""
-
-    def __init__(self):
-        self._cost = 0.0
-        self._n_calls = 0
-        self._lock = threading.Lock()
-        self.cost_limit = 0.0
-        self.call_limit = 0
-
-    def add(self, cost: float) -> None:
-        """Add a model call with its cost, checking limits."""
-        with self._lock:
-            self._cost += cost
-            self._n_calls += 1
-        if 0 < self.cost_limit < self._cost or 0 < self.call_limit < self._n_calls + 1:
-            raise RuntimeError(
-                f"Global cost/call limit exceeded: ${self._cost:.4f} / {self._n_calls}"
-            )
-
-    @property
-    def cost(self) -> float:
-        return self._cost
-
-    @property
-    def n_calls(self) -> int:
-        return self._n_calls
-
-
-GLOBAL_MODEL_STATS = GlobalModelStats()
-
 
 def get_model(input_model_name: str | None = None, config: dict | None = None) -> Model:
     """Get an initialized model object from any kind of user input or settings."""
@@ -1992,115 +1949,7 @@ def format_toolcall_observation_messages_response(
         results.append(msg)
     return results
 
-    # ==============================
-    # Models - litellm model
 
-    multimodal_regex: str = ""
-
-    def _query(self, messages: list[dict[str, str]], **kwargs):
-        try:
-            # Set default API base to local OpenAI-compatible endpoint
-            model_kwargs = self.config.model_kwargs | kwargs
-            if "api_base" not in model_kwargs:
-                model_kwargs["api_base"] = "http://127.0.0.1:8080/v1"
-            # Ensure we have an API key (any value works)
-            if "api_key" not in model_kwargs:
-                model_kwargs["api_key"] = "placeholder-key"
-
-            return litellm.completion(
-                model=self.config.model_name,
-                messages=messages,
-                tools=[BASH_TOOL],
-                **model_kwargs,
-            )
-        except litellm.exceptions.AuthenticationError as e:
-            e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
-            raise e
-
-    def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
-        prepared = [{k: v for k, v in msg.items() if k != "extra"} for msg in messages]
-        prepared = _reorder_anthropic_thinking_blocks(prepared)
-        return set_cache_control(prepared, mode=self.config.set_cache_control)
-
-    def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
-        for attempt in retry(
-            logger=logging.getLogger("litellm_model"),
-            abort_exceptions=self.abort_exceptions,
-        ):
-            with attempt:
-                response = self._query(
-                    self._prepare_messages_for_api(messages), **kwargs
-                )
-        cost_output = self._calculate_cost(response)
-        GLOBAL_MODEL_STATS.add(cost_output["cost"])
-        message = response.choices[0].message.model_dump()
-        message["extra"] = {
-            "actions": self._parse_actions(response),
-            "response": response.model_dump(),
-            **cost_output,
-            "timestamp": time.time(),
-        }
-        return message
-
-    def _calculate_cost(self, response) -> dict[str, float]:
-        try:
-            cost = litellm.cost_calculator.completion_cost(
-                response, model=self.config.model_name
-            )
-            if cost <= 0.0:
-                raise ValueError(f"Cost must be > 0.0, got {cost}")
-        except Exception as e:
-            cost = 0.0
-            if self.config.cost_tracking != "ignore_errors":
-                msg = (
-                    f"Error calculating cost for model {self.config.model_name}: {e}, perhaps it's not registered? "
-                    "You can ignore this issue from your config file with cost_tracking: 'ignore_errors' or "
-                    "globally with export MSWEA_COST_TRACKING='ignore_errors'. "
-                    "Alternatively check the 'Cost tracking' section in the documentation at "
-                    "https://klieret.short.gy/mini-local-models. "
-                    " Still stuck? Please open a github issue at https://github.com/SWE-agent/mini-swe-agent/issues/new/choose!"
-                )
-                logging.getLogger("litellm_model").critical(msg)
-                raise RuntimeError(msg) from e
-        return {"cost": cost}
-
-    def _parse_actions(self, response) -> list[dict]:
-        tool_calls = response.choices[0].message.tool_calls or []
-        return parse_toolcall_actions(
-            tool_calls, format_error_template=self.config.format_error_template
-        )
-
-    def format_message(self, **kwargs) -> dict:
-        return expand_multimodal_content(kwargs, pattern=self.config.multimodal_regex)
-
-    def format_observation_messages(
-        self, message: dict, outputs: list[dict], template_vars: dict | None = None
-    ) -> list[dict]:
-        actions = message.get("extra", {}).get("actions", [])
-        return format_toolcall_observation_messages(
-            actions=actions,
-            outputs=outputs,
-            observation_template=self.config.observation_template,
-            template_vars=template_vars,
-            multimodal_regex=self.config.multimodal_regex,
-        )
-
-    def get_template_vars(self, **kwargs) -> dict[str, Any]:
-        return self.config.model_dump()
-
-    def serialize(self) -> dict:
-        return {
-            "info": {
-                "config": {
-                    "model": self.config.model_dump(mode="json"),
-                    "model_type": f"{self.__class__.__module__}.{self.__class__.__name__}",
-                },
-            }
-        }
-
-
-# ==============================
-# Models - litellm textbased model
 # ==============================
 
 
@@ -2115,9 +1964,6 @@ class OpenRouterModelConfig(BaseModel):
     model_name: str
     model_kwargs: dict[str, Any] = {}
     set_cache_control: Literal["default_end"] | None = None
-    cost_tracking: Literal["default", "ignore_errors"] = os.getenv(
-        "MSWEA_COST_TRACKING", "default"
-    )
     format_error_template: str = "{{ error }}"
     observation_template: str = (
         "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
@@ -2205,29 +2051,13 @@ class OpenRouterModel:
                 response = self._query(
                     self._prepare_messages_for_api(messages), **kwargs
                 )
-        cost_output = self._calculate_cost(response)
-        GLOBAL_MODEL_STATS.add(cost_output["cost"])
         message = dict(response["choices"][0]["message"])
         message["extra"] = {
             "actions": self._parse_actions(response),
             "response": response,
-            **cost_output,
             "timestamp": time.time(),
         }
         return message
-
-    def _calculate_cost(self, response) -> dict[str, float]:
-        usage = response.get("usage", {})
-        cost = usage.get("cost", 0.0)
-        if cost <= 0.0 and self.config.cost_tracking != "ignore_errors":
-            raise RuntimeError(
-                f"No valid cost information available from OpenRouter API for model {self.config.model_name}: "
-                f"Usage {usage}, cost {cost}. Cost must be > 0.0. Set cost_tracking: 'ignore_errors' in your config file or "
-                "export MSWEA_COST_TRACKING='ignore_errors' to ignore cost tracking errors "
-                "(for example for free/local models), more information at https://klieret.short.gy/mini-local-models "
-                "for more details. Still stuck? Please open a github issue at https://github.com/SWE-agent/mini-swe-agent/issues/new/choose!"
-            )
-        return {"cost": cost}
 
     def _parse_actions(self, response: dict) -> list[dict]:
         tool_calls = response["choices"][0]["message"].get("tool_calls") or []
@@ -2395,12 +2225,9 @@ class OpenRouterResponseModel(OpenRouterModel):
                 response = self._query(
                     self._prepare_messages_for_api(messages), **kwargs
                 )
-        cost_output = self._calculate_cost(response)
-        GLOBAL_MODEL_STATS.add(cost_output["cost"])
         message = dict(response)
         message["extra"] = {
             "actions": self._parse_actions(response),
-            **cost_output,
             "timestamp": time.time(),
         }
         return message
@@ -2453,9 +2280,6 @@ class PortkeyModelConfig(BaseModel):
     model_kwargs: dict[str, Any] = {}
     provider: str = ""
     set_cache_control: Literal["default_end"] | None = None
-    cost_tracking: Literal["default", "ignore_errors"] = os.getenv(
-        "MSWEA_COST_TRACKING", "default"
-    )
     format_error_template: str = "{{ error }}"
     observation_template: str = (
         "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
@@ -2512,13 +2336,10 @@ class PortkeyModel:
                 response = self._query(
                     self._prepare_messages_for_api(messages), **kwargs
                 )
-        cost_output = self._calculate_cost(response)
-        GLOBAL_MODEL_STATS.add(cost_output["cost"])
         message = response.choices[0].message.model_dump()
         message["extra"] = {
             "actions": self._parse_actions(response),
             "response": response.model_dump(),
-            **cost_output,
             "timestamp": time.time(),
         }
         return message
@@ -2557,10 +2378,6 @@ class PortkeyModel:
             }
         }
 
-    def _calculate_cost(self, response) -> dict[str, float]:
-        # Cost calculation not supported without LiteLLM
-        return {"cost": 0.0}
-
 
 # ==============================
 # Models - portkey response model
@@ -2570,9 +2387,6 @@ class PortkeyModel:
 class PortkeyResponseAPIModelConfig(BaseModel):
     model_name: str
     model_kwargs: dict[str, Any] = {}
-    cost_tracking: Literal["default", "ignore_errors"] = os.getenv(
-        "MSWEA_COST_TRACKING", "default"
-    )
     format_error_template: str = "{{ error }}"
     observation_template: str = (
         "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
@@ -2632,14 +2446,11 @@ class PortkeyResponseAPIModel:
                 response = self._query(
                     self._prepare_messages_for_api(messages), **kwargs
                 )
-        cost_output = self._calculate_cost(response)
-        GLOBAL_MODEL_STATS.add(cost_output["cost"])
         message = (
             response.model_dump() if hasattr(response, "model_dump") else dict(response)
         )
         message["extra"] = {
             "actions": self._parse_actions(response),
-            **cost_output,
             "timestamp": time.time(),
         }
         return message
@@ -2653,10 +2464,6 @@ class PortkeyResponseAPIModel:
         return parse_toolcall_actions_response(
             output, format_error_template=self.config.format_error_template
         )
-
-    def _calculate_cost(self, response) -> dict[str, float]:
-        # Cost calculation not supported without LiteLLM
-        return {"cost": 0.0}
 
     def format_message(self, **kwargs) -> dict:
         role = kwargs.get("role", "user")
@@ -2784,20 +2591,13 @@ class RequestyModel:
                 response = self._query(
                     self._prepare_messages_for_api(messages), **kwargs
                 )
-        cost_output = self._calculate_cost(response)
-        GLOBAL_MODEL_STATS.add(cost_output["cost"])
         message = dict(response["choices"][0]["message"])
         message["extra"] = {
             "actions": self._parse_actions(response),
             "response": response,
-            **cost_output,
             "timestamp": time.time(),
         }
         return message
-
-    def _calculate_cost(self, response) -> dict[str, float]:
-        # Cost calculation not supported for local API
-        return {"cost": 0.0}
 
     def _parse_actions(self, response: dict) -> list[dict]:
         tool_calls = response["choices"][0]["message"].get("tool_calls") or []
@@ -2902,7 +2702,6 @@ def _process_test_actions(actions: list[dict]) -> bool:
 class DeterministicModelConfig(BaseModel):
     outputs: list[dict]
     model_name: str = "deterministic"
-    cost_per_call: float = 1.0
     observation_template: str = (
         "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
         "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
@@ -2920,7 +2719,6 @@ class DeterministicModel:
         output = self.config.outputs[self.current_index]
         if _process_test_actions(output.get("extra", {}).get("actions", [])):
             return self.query(messages, **kwargs)
-        GLOBAL_MODEL_STATS.add(self.config.cost_per_call)
         return output
 
     def format_message(self, **kwargs) -> dict:
@@ -2953,7 +2751,6 @@ class DeterministicModel:
 class DeterministicToolcallModelConfig(BaseModel):
     outputs: list[dict]
     model_name: str = "deterministic_toolcall"
-    cost_per_call: float = 1.0
     observation_template: str = (
         "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
         "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
@@ -2971,7 +2768,6 @@ class DeterministicToolcallModel:
         output = self.config.outputs[self.current_index]
         if _process_test_actions(output.get("extra", {}).get("actions", [])):
             return self.query(messages, **kwargs)
-        GLOBAL_MODEL_STATS.add(self.config.cost_per_call)
         return output
 
     def format_message(self, **kwargs) -> dict:
@@ -3006,7 +2802,6 @@ class DeterministicToolcallModel:
 class DeterministicResponseAPIToolcallModelConfig(BaseModel):
     outputs: list[dict]
     model_name: str = "deterministic_response_api_toolcall"
-    cost_per_call: float = 1.0
     observation_template: str = (
         "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
         "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
@@ -3024,7 +2819,6 @@ class DeterministicResponseAPIToolcallModel:
         output = self.config.outputs[self.current_index]
         if _process_test_actions(output.get("extra", {}).get("actions", [])):
             return self.query(messages, **kwargs)
-        GLOBAL_MODEL_STATS.add(self.config.cost_per_call)
         return output
 
     def format_message(self, **kwargs) -> dict:
@@ -3080,7 +2874,6 @@ DEFAULT_AGENT_CONFIG = {
         "system_template": "You are a helpful assistant that can execute commands on the local machine. When you are done, you must submit your final answer. To submit, you must print 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT' followed by your final answer.",
         "instance_template": "Complete the following task: {{task}}",
         "step_limit": 10,
-        "cost_limit": 3.0,
         "output_path": None,
     }
 }
@@ -3189,9 +2982,6 @@ def main(
         None, "-t", "--task", help="Task/problem statement", show_default=False
     ),
     yolo: bool = typer.Option(False, "-y", "--yolo", help="Run without confirmation"),
-    cost_limit: float | None = typer.Option(
-        None, "-l", "--cost-limit", help="Cost limit. Set to 0 to disable."
-    ),
     config_spec: list[str] = typer.Option(
         [], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT
     ),
@@ -3222,7 +3012,6 @@ def main(
             "agent": {
                 "agent_class": agent_class or UNSET,
                 "mode": "yolo" if yolo else UNSET,
-                "cost_limit": cost_limit or UNSET,
                 "confirm_exit": False if exit_immediately else UNSET,
                 "output_path": output or UNSET,
             },
