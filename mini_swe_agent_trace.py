@@ -3328,9 +3328,9 @@ import yaml
 # Default configurations
 DEFAULT_AGENT_CONFIG = {
     "agent": {
-        "system_template": "You are a helpful assistant that can execute commands on the local machine.",
+        "system_template": "You are a helpful assistant that can execute commands on the local machine. When you are done, you must submit your final answer. To submit, you must print 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT' followed by your final answer.",
         "instance_template": "Complete the following task: {{task}}",
-        "step_limit": 0,
+        "step_limit": 10,
         "cost_limit": 3.0,
         "output_path": None,
     }
@@ -3371,16 +3371,8 @@ from typer import Argument, Typer
 
 
 def configure_if_first_time():
-    # Skip interactive setup - automatically mark as configured
-    if not os.getenv("MSWEA_CONFIGURED"):
-        global_config_dir = Path(
-            os.getenv("MSWEA_GLOBAL_CONFIG_DIR") or user_config_dir("mini-swe-agent")
-        )
-        global_config_file = Path(global_config_dir) / ".env"
-        set_key(global_config_file, "MSWEA_CONFIGURED", "true")
-        # Also ensure model name is set to a default if not provided
-        if not os.getenv("MSWEA_MODEL_NAME"):
-            set_key(global_config_file, "MSWEA_MODEL_NAME", "gpt-3.5-turbo")
+    # No-op since we've removed environment variable configuration
+    pass
 
 
 def setup():
