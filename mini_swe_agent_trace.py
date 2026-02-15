@@ -3375,60 +3375,6 @@ def configure_if_first_time():
     pass
 
 
-def setup():
-    global_config_dir = Path(
-        os.getenv("MSWEA_GLOBAL_CONFIG_DIR") or user_config_dir("mini-swe-agent")
-    )
-    global_config_file = Path(global_config_dir) / ".env"
-    console = Console(highlight=False)
-    _SETUP_HELP = """To get started, we need to set up your global config file.
-
-You can edit it manually or use the [bold green]mini-extra config set[/bold green] or [bold green]mini-extra config edit[/bold green] commands.
-
-This setup will ask you for your model and an API key.
-
-Here's a few popular models and the required API keys:
-
-[bold green]anthropic/claude-sonnet-4-5-20250929[/bold green] ([bold green]ANTHROPIC_API_KEY[/bold green])
-[bold green]openai/gpt-5[/bold green] or [bold green]openai/gpt-5-mini[/bold green] ([bold green]OPENAI_API_KEY[/bold green])
-[bold green]gemini/gemini-3-pro-preview[/bold green] ([bold green]GEMINI_API_KEY[/bold green])
-
-[bold]Note: Please always include the provider (e.g., "openai/") in the model name.[/bold]
-
-[bold yellow]You can leave any setting blank to skip it.[/bold yellow]
-
-More information at https://mini-swe-agent.com/latest/quickstart/
-To find the best model, check the leaderboard at https://swebench.com/
-"""
-    console.print(_SETUP_HELP)
-    default_model = prompt(
-        "Enter your default model (e.g., anthropic/claude-sonnet-4-5-20250929): ",
-        default=os.getenv("MSWEA_MODEL_NAME", ""),
-    ).strip()
-    if default_model:
-        set_key(global_config_file, "MSWEA_MODEL_NAME", default_model)
-    console.print(
-        "[bold yellow]If you already have your API keys set as environment variables, you can ignore the next question.[/bold yellow]"
-    )
-    key_name = prompt("Enter your API key name (e.g., ANTHROPIC_API_KEY): ").strip()
-    key_value = None
-    if key_name:
-        key_value = prompt(
-            "Enter your API key value (e.g., sk-1234567890): ",
-            default=os.getenv(key_name, ""),
-        ).strip()
-        if key_value:
-            set_key(global_config_file, key_name, key_value)
-    if not key_value:
-        console.print(
-            "[bold red]API key setup not completed.[/bold red] Totally fine if you have your keys as environment variables."
-        )
-    set_key(global_config_file, "MSWEA_CONFIGURED", "true")
-    console.print(
-        "\n[bold yellow]Config finished.[/bold yellow] If you want to revisit it, run [bold green]mini-extra config setup[/bold green]."
-    )
-
-
 # ==============================
 # Run - main mini command
 # ==============================
