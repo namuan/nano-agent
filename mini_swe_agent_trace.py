@@ -5,7 +5,6 @@
 #   "requests",
 #   "jinja2",
 #   "pydantic >= 2.0",
-#   "litellm >= 1.75.5",
 #   "tenacity",
 #   "rich",
 #   "python-dotenv",
@@ -1441,9 +1440,6 @@ def get_model_name(
 
 
 _MODEL_CLASS_MAPPING = {
-    "litellm": "LitellmModel",
-    "litellm_textbased": "LitellmTextbasedModel",
-    "litellm_response": "LitellmResponseModel",
     "openrouter": "OpenRouterModel",
     "openrouter_textbased": "OpenRouterTextbasedModel",
     "openrouter_response": "OpenRouterResponseModel",
@@ -1467,8 +1463,8 @@ def get_model_class(model_name: str, model_class: str = "") -> type:
             msg = f"Unknown model class: {model_class} (available: {_MODEL_CLASS_MAPPING})"
             raise ValueError(msg)
 
-    # Since all code is in a single file, we can return the LitellmModel class directly
-    return LitellmModel
+    # Default to RequestyModel if no specific model class is specified
+    return RequestyModel
 
 
 # ==============================
@@ -1996,49 +1992,10 @@ def format_toolcall_observation_messages_response(
         results.append(msg)
     return results
 
+    # ==============================
+    # Models - litellm model
 
-# ==============================
-# Models - litellm model
-# ==============================
-
-import litellm
-
-
-class LitellmModelConfig(BaseModel):
-    model_name: str
-    model_kwargs: dict[str, Any] = {}
-    litellm_model_registry: Path | str | None = os.getenv("LITELLM_MODEL_REGISTRY_PATH")
-    set_cache_control: Literal["default_end"] | None = None
-    cost_tracking: Literal["default", "ignore_errors"] = os.getenv(
-        "MSWEA_COST_TRACKING", "default"
-    )
-    format_error_template: str = "{{ error }}"
-    observation_template: str = (
-        "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
-        "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
-    )
     multimodal_regex: str = ""
-
-
-class LitellmModel:
-    abort_exceptions: list[type[Exception]] = [
-        litellm.exceptions.UnsupportedParamsError,
-        litellm.exceptions.NotFoundError,
-        litellm.exceptions.PermissionDeniedError,
-        litellm.exceptions.ContextWindowExceededError,
-        litellm.exceptions.AuthenticationError,
-        KeyboardInterrupt,
-    ]
-
-    def __init__(self, *, config_class: Any = LitellmModelConfig, **kwargs):
-        self.config = config_class(**kwargs)
-        if (
-            self.config.litellm_model_registry
-            and Path(self.config.litellm_model_registry).is_file()
-        ):
-            litellm.utils.register_model(
-                json.loads(Path(self.config.litellm_model_registry).read_text())
-            )
 
     def _query(self, messages: list[dict[str, str]], **kwargs):
         try:
@@ -2145,128 +2102,6 @@ class LitellmModel:
 # ==============================
 # Models - litellm textbased model
 # ==============================
-
-
-class LitellmTextbasedModelConfig(LitellmModelConfig):
-    action_regex: str = r"```mswea_bash_command\s*\n(.*?)\n```"
-    format_error_template: str = "Please always provide EXACTLY ONE action in triple backticks, found {{actions|length}} actions."
-
-
-class LitellmTextbasedModel(LitellmModel):
-    def __init__(self, **kwargs):
-        super().__init__(config_class=LitellmTextbasedModelConfig, **kwargs)
-
-    def _query(self, messages: list[dict[str, str]], **kwargs):
-        try:
-            # Set default API base to local OpenAI-compatible endpoint
-            model_kwargs = self.config.model_kwargs | kwargs
-            if "api_base" not in model_kwargs:
-                model_kwargs["api_base"] = "http://127.0.0.1:8080/v1"
-            # Ensure we have an API key (any value works)
-            if "api_key" not in model_kwargs:
-                model_kwargs["api_key"] = "placeholder-key"
-
-            return litellm.completion(
-                model=self.config.model_name,
-                messages=messages,
-                **model_kwargs,
-            )
-        except litellm.exceptions.AuthenticationError as e:
-            e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
-            raise e
-
-    def _parse_actions(self, response: dict) -> list[dict]:
-        content = response.choices[0].message.content or ""
-        return parse_regex_actions(
-            content,
-            action_regex=self.config.action_regex,
-            format_error_template=self.config.format_error_template,
-        )
-
-    def format_observation_messages(
-        self, message: dict, outputs: list[dict], template_vars: dict | None = None
-    ) -> list[dict]:
-        return format_observation_messages(
-            outputs,
-            observation_template=self.config.observation_template,
-            template_vars=template_vars,
-            multimodal_regex=self.config.multimodal_regex,
-        )
-
-
-# ==============================
-# Models - litellm response model
-# ==============================
-
-
-class LitellmResponseModelConfig(LitellmModelConfig):
-    pass
-
-
-class LitellmResponseModel(LitellmModel):
-    def __init__(self, *, config_class: Any = LitellmResponseModelConfig, **kwargs):
-        super().__init__(config_class=config_class, **kwargs)
-
-    def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
-        result = []
-        for msg in messages:
-            if msg.get("object") == "response":
-                for item in msg.get("output", []):
-                    result.append({k: v for k, v in item.items() if k != "extra"})
-            else:
-                result.append({k: v for k, v in msg.items() if k != "extra"})
-        return result
-
-    def _query(self, messages: list[dict[str, str]], **kwargs):
-        try:
-            return litellm.responses(
-                model=self.config.model_name,
-                input=messages,
-                tools=[BASH_TOOL_RESPONSE_API],
-                **(self.config.model_kwargs | kwargs),
-            )
-        except litellm.exceptions.AuthenticationError as e:
-            e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
-            raise e
-
-    def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
-        for attempt in retry(
-            logger=logging.getLogger("litellm_response_model"),
-            abort_exceptions=self.abort_exceptions,
-        ):
-            with attempt:
-                response = self._query(
-                    self._prepare_messages_for_api(messages), **kwargs
-                )
-        cost_output = self._calculate_cost(response)
-        GLOBAL_MODEL_STATS.add(cost_output["cost"])
-        message = (
-            response.model_dump() if hasattr(response, "model_dump") else dict(response)
-        )
-        message["extra"] = {
-            "actions": self._parse_actions(response),
-            **cost_output,
-            "timestamp": time.time(),
-        }
-        return message
-
-    def _parse_actions(self, response) -> list[dict]:
-        return parse_toolcall_actions_response(
-            getattr(response, "output", []),
-            format_error_template=self.config.format_error_template,
-        )
-
-    def format_observation_messages(
-        self, message: dict, outputs: list[dict], template_vars: dict | None = None
-    ) -> list[dict]:
-        actions = message.get("extra", {}).get("actions", [])
-        return format_toolcall_observation_messages(
-            actions=actions,
-            outputs=outputs,
-            observation_template=self.config.observation_template,
-            template_vars=template_vars,
-            multimodal_regex=self.config.multimodal_regex,
-        )
 
 
 # ==============================
@@ -2617,8 +2452,6 @@ class PortkeyModelConfig(BaseModel):
     model_name: str
     model_kwargs: dict[str, Any] = {}
     provider: str = ""
-    litellm_model_registry: Path | str | None = os.getenv("LITELLM_MODEL_REGISTRY_PATH")
-    litellm_model_name_override: str = ""
     set_cache_control: Literal["default_end"] | None = None
     cost_tracking: Literal["default", "ignore_errors"] = os.getenv(
         "MSWEA_COST_TRACKING", "default"
@@ -2636,14 +2469,6 @@ class PortkeyModel:
 
     def __init__(self, *, config_class: type = PortkeyModelConfig, **kwargs):
         self.config = config_class(**kwargs)
-        if (
-            self.config.litellm_model_registry
-            and Path(self.config.litellm_model_registry).is_file()
-        ):
-            litellm.utils.register_model(
-                json.loads(Path(self.config.litellm_model_registry).read_text())
-            )
-
         self._api_key = os.getenv("PORTKEY_API_KEY")
         if not self._api_key:
             raise ValueError(
@@ -2733,53 +2558,8 @@ class PortkeyModel:
         }
 
     def _calculate_cost(self, response) -> dict[str, float]:
-        response_for_cost_calc = response.model_copy()
-        if self.config.litellm_model_name_override:
-            if response_for_cost_calc.model:
-                response_for_cost_calc.model = self.config.litellm_model_name_override
-        prompt_tokens = response_for_cost_calc.usage.prompt_tokens
-        if prompt_tokens is None:
-            logging.getLogger("portkey_model").warning(
-                f"Prompt tokens are None for model {self.config.model_name}. Setting to 0. Full response: {response_for_cost_calc.model_dump()}"
-            )
-            prompt_tokens = 0
-        total_tokens = response_for_cost_calc.usage.total_tokens
-        completion_tokens = response_for_cost_calc.usage.completion_tokens
-        if completion_tokens is None:
-            logging.getLogger("portkey_model").warning(
-                f"Completion tokens are None for model {self.config.model_name}. Setting to 0. Full response: {response_for_cost_calc.model_dump()}"
-            )
-            completion_tokens = 0
-        if total_tokens - prompt_tokens - completion_tokens != 0:
-            logging.getLogger("portkey_model").warning(
-                f"WARNING: Total tokens - prompt tokens - completion tokens != 0: {response_for_cost_calc.model_dump()}."
-                " This is probably a portkey bug or incompatibility with litellm cost tracking. "
-                "Setting prompt tokens based on total tokens and completion tokens. You might want to double check your costs. "
-                f"Full response: {response_for_cost_calc.model_dump()}"
-            )
-            response_for_cost_calc.usage.prompt_tokens = (
-                total_tokens - completion_tokens
-            )
-        try:
-            cost = litellm.cost_calculator.completion_cost(
-                response_for_cost_calc,
-                model=self.config.litellm_model_name_override or None,
-            )
-            assert cost >= 0.0, f"Cost is negative: {cost}"
-        except Exception as e:
-            cost = 0.0
-            if self.config.cost_tracking != "ignore_errors":
-                msg = (
-                    f"Error calculating cost for model {self.config.model_name} based on {response_for_cost_calc.model_dump()}: {e}. "
-                    "You can ignore this issue from your config file with cost_tracking: 'ignore_errors' or "
-                    "globally with export MSWEA_COST_TRACKING='ignore_errors' to ignore this error. "
-                    "Alternatively check the 'Cost tracking' section in the documentation at "
-                    "https://klieret.short.gy/mini-local-models. "
-                    "Still stuck? Please open a github issue at https://github.com/SWE-agent/mini-swe-agent/issues/new/choose!"
-                )
-                logging.getLogger("portkey_model").critical(msg)
-                raise RuntimeError(msg) from e
-        return {"cost": cost}
+        # Cost calculation not supported without LiteLLM
+        return {"cost": 0.0}
 
 
 # ==============================
@@ -2790,8 +2570,6 @@ class PortkeyModel:
 class PortkeyResponseAPIModelConfig(BaseModel):
     model_name: str
     model_kwargs: dict[str, Any] = {}
-    litellm_model_registry: Path | str | None = os.getenv("LITELLM_MODEL_REGISTRY_PATH")
-    litellm_model_name_override: str = ""
     cost_tracking: Literal["default", "ignore_errors"] = os.getenv(
         "MSWEA_COST_TRACKING", "default"
     )
@@ -2808,14 +2586,6 @@ class PortkeyResponseAPIModel:
 
     def __init__(self, **kwargs):
         self.config = PortkeyResponseAPIModelConfig(**kwargs)
-        if (
-            self.config.litellm_model_registry
-            and Path(self.config.litellm_model_registry).is_file()
-        ):
-            litellm.utils.register_model(
-                json.loads(Path(self.config.litellm_model_registry).read_text())
-            )
-
         self._api_key = os.getenv("PORTKEY_API_KEY")
         if not self._api_key:
             raise ValueError(
@@ -2885,21 +2655,8 @@ class PortkeyResponseAPIModel:
         )
 
     def _calculate_cost(self, response) -> dict[str, float]:
-        try:
-            cost = litellm.cost_calculator.completion_cost(
-                response,
-                model=self.config.litellm_model_name_override or self.config.model_name,
-            )
-            assert cost > 0.0, f"Cost is not positive: {cost}"
-        except Exception as e:
-            if self.config.cost_tracking != "ignore_errors":
-                raise RuntimeError(
-                    f"Error calculating cost for model {self.config.model_name}: {e}. "
-                    "You can ignore this issue from your config file with cost_tracking: 'ignore_errors' or "
-                    "globally with export MSWEA_COST_TRACKING='ignore_errors' to ignore this error. "
-                ) from e
-            cost = 0.0
-        return {"cost": cost}
+        # Cost calculation not supported without LiteLLM
+        return {"cost": 0.0}
 
     def format_message(self, **kwargs) -> dict:
         role = kwargs.get("role", "user")
@@ -2978,15 +2735,13 @@ class RequestyModel:
 
     def __init__(self, **kwargs):
         self.config = RequestyModelConfig(**kwargs)
-        self._api_url = "https://router.requesty.ai/v1/chat/completions"
-        self._api_key = os.getenv("REQUESTY_API_KEY", "")
+        self._api_url = "http://127.0.0.1:8080/v1/chat/completions"
+        self._api_key = "anything"  # Any value works
 
     def _query(self, messages: list[dict[str, str]], **kwargs):
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/SWE-agent/mini-swe-agent",
-            "X-Title": "mini-swe-agent",
         }
 
         payload = {
@@ -3041,14 +2796,8 @@ class RequestyModel:
         return message
 
     def _calculate_cost(self, response) -> dict[str, float]:
-        usage = response.get("usage", {})
-        cost = usage.get("cost", 0.0)
-        if cost == 0.0:
-            raise RequestyAPIError(
-                f"No cost information available from Requesty API for model {self.config.model_name}. "
-                "Cost tracking is required but not provided by the API response."
-            )
-        return {"cost": cost}
+        # Cost calculation not supported for local API
+        return {"cost": 0.0}
 
     def _parse_actions(self, response: dict) -> list[dict]:
         tool_calls = response["choices"][0]["message"].get("tool_calls") or []
@@ -3421,7 +3170,7 @@ def main(
     model_class: str | None = typer.Option(
         None,
         "--model-class",
-        help="Model class to use (e.g., 'litellm' or 'minisweagent.models.litellm_model.LitellmModel')",
+        help="Model class to use (e.g., 'requesty' or 'minisweagent.models.requesty_model.RequestyModel')",
         rich_help_panel="Advanced",
     ),
     agent_class: str | None = typer.Option(
@@ -3529,7 +3278,7 @@ def hello_world(
 ) -> DefaultAgent:
     logging.basicConfig(level=logging.DEBUG)
     agent = DefaultAgent(
-        LitellmModel(model_name=model_name),
+        RequestyModel(model_name=model_name),
         LocalEnvironment(),
         **DEFAULT_AGENT_CONFIG["agent"],
     )
